@@ -10,12 +10,32 @@ Deleting a key from the code is **not enough**. Git keeps every version of every
 
 ## Features
 
-- Detects 7 types of secrets: Anthropic, OpenAI, AWS, GitHub, Stripe, Google API keys, and private keys
+- Detects **12 types of secrets** (see the table below)
 - Finds `.env` files and checks whether they are protected by `.gitignore`
 - **Scans the full git history** on all branches, and reports the exact commit where a secret was first added
 - **Scans remote repos by URL**: clones into a temporary folder and always deletes it afterwards
+- **Smart detection** that skips public keys and example values, to keep false positives low
 - Ranks every finding by severity
 - Masks secrets in the output, so the scanner never leaks what it finds
+
+## Detected secrets
+
+| Category | Secret |
+|---|---|
+| AI providers | Anthropic API key, OpenAI API key |
+| Cloud | AWS access key, Google API key, Google service account JSON |
+| Dev platforms | GitHub token, Stripe live key |
+| Supabase | `service_role` key (JWT), `sb_secret_` key |
+| Bots | Telegram bot token |
+| Databases | Postgres / MySQL / MongoDB / Redis / AMQP URLs with a password |
+| Crypto | RSA / EC / OpenSSH private keys |
+
+## Smart detection
+
+Not everything that looks like a key is a secret:
+
+- **Supabase JWTs are decoded.** The `anon` key is public by design, so it is skipped. Only a token whose payload says `"role": "service_role"` is reported, because that key bypasses all database permissions.
+- **Example database URLs are skipped.** URLs like `postgresql://user:password@localhost` or `postgresql://admin:${DB_PASSWORD}@host` appear in countless tutorials and templates, so placeholder passwords are ignored.
 
 ## Severity levels
 
@@ -72,11 +92,14 @@ Version 0.2 missed this case (a **false negative**), because it only read the cu
 1. **Clone** (remote only): `git clone` into a temporary folder, with full history
 2. **Walk** the folder with `os.walk`, skipping folders like `node_modules` and `.git`
 3. **Match** each line against regex signatures of known key formats
-4. **Mask** every secret before printing it
-5. **Ask git** whether each file is ignored or was ever committed
-6. **Scan history**: read every added line in every commit
-7. **Rank** each finding by severity and print a report
-8. **Clean up**: the temporary clone is deleted in a `finally` block, even if the scan fails
+4. **Validate** matches: decode JWTs, skip placeholder passwords
+5. **Mask** every secret before printing it
+6. **Ask git** whether each file is ignored or was ever committed
+7. **Scan history**: read every added line in every commit
+8. **Rank** each finding by severity and print a report
+9. **Clean up**: the temporary clone is deleted in a `finally` block, even if the scan fails
+
+All detection logic lives in one function, `find_secrets()`, which is shared by the file scan and the history scan.
 
 ## Security notes
 
@@ -90,8 +113,10 @@ Version 0.2 missed this case (a **false negative**), because it only read the cu
 - [x] Git-aware severity levels
 - [x] Full git history scanning
 - [x] Scan remote repos by URL
-- [ ] More secret types (Supabase, Firebase, Telegram bots, database URLs)
+- [x] More secret types (Supabase, Telegram bots, database URLs, service accounts)
+- [ ] Check Supabase / Firebase databases for missing access rules
 - [ ] Scan live websites' JavaScript bundles for leaked keys
+- [ ] Install with `pip install` and run as `leaklens .`
 - [ ] Web dashboard (FastAPI + Next.js) with AI-generated fix explanations
 
 ## Ethical use
