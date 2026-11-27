@@ -1,0 +1,13 @@
+# Secrets - never upload
+.env
+.env.*
+!.env.example
+
+# Test file with fake keys (GitHub would block the push)
+fake_config.py
+
+# Python junk
+__pycache__/
+*.pyc
+venv/
+.venv/
