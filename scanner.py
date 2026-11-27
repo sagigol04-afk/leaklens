@@ -1,5 +1,5 @@
 """
-LeakLens - Step 2: Secret scanner with git awareness and severity levels
+LeakLens v0.3 - Secret scanner with git history scanning
 Usage: python scanner.py [folder]
 """
 
@@ -46,6 +46,8 @@ def run_git(root, args):
             ["git", "-C", root] + args,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="ignore",
         )
     except FileNotFoundError:
         return None
@@ -95,7 +97,7 @@ def classify(root, rel_path, in_git, cache):
     return status
 
 
-# ---------- scanning ----------
+# ---------- scanning current files ----------
 
 def scan_file(path):
     """Scan one file line by line and return all findings."""
@@ -105,7 +107,7 @@ def scan_file(path):
             for line_number, line in enumerate(f, start=1):
                 for name, pattern in PATTERNS.items():
                     for match in pattern.finditer(line):
-                        findings.append((name, line_number, mask(match.group())))
+                        findings.append((name, line_number, match.group()))
     except OSError:
         pass
     return findings
@@ -132,15 +134,59 @@ def scan_folder(root):
                 continue
 
             files_scanned += 1
-            for name, line_number, masked in scan_file(path):
+            for name, line_number, secret in scan_file(path):
                 findings.append({
                     "file": rel_path,
                     "type": name,
                     "line": line_number,
-                    "value": masked,
+                    "value": mask(secret),
+                    "raw": secret,
                 })
 
     return findings, env_files, files_scanned
+
+
+# ---------- scanning git history ----------
+
+def scan_git_history(root):
+    """Scan every line that was ever ADDED in any commit, on all branches."""
+    result = run_git(root, [
+        "log", "-p", "--all", "--no-color",
+        "--date=short", "--format=COMMIT %h %ad",
+    ])
+    if result is None or result.returncode != 0:
+        return [], 0
+
+    found = {}
+    commits_scanned = 0
+    commit, date, current_file = "?", "?", "?"
+
+    for line in result.stdout.splitlines():
+        if line.startswith("COMMIT "):
+            parts = line.split()
+            commit = parts[1]
+            date = parts[2] if len(parts) > 2 else "?"
+            commits_scanned += 1
+
+        elif line.startswith("+++ "):
+            current_file = line[6:] if line.startswith("+++ b/") else line[4:]
+
+        elif line.startswith("+"):
+            for name, pattern in PATTERNS.items():
+                for match in pattern.finditer(line):
+                    secret = match.group()
+                    # git log shows newest first, so the LAST time we see
+                    # a secret is the commit where it was first added.
+                    found[secret] = {
+                        "file": current_file,
+                        "type": name,
+                        "commit": commit,
+                        "date": date,
+                        "value": mask(secret),
+                        "raw": secret,
+                    }
+
+    return list(found.values()), commits_scanned
 
 
 # ---------- report ----------
@@ -156,6 +202,7 @@ def main():
     print(f"Scanning: {os.path.abspath(root)}")
     print(f"Git repo: {'yes' if in_git else 'no'}\n")
 
+    # 1. Current files
     findings, env_files, files_scanned = scan_folder(root)
     cache = {}
 
@@ -167,8 +214,29 @@ def main():
         severity, reason = classify(root, rel_path, in_git, cache)
         env_report.append({"file": rel_path, "severity": severity, "reason": reason})
 
+    # 2. Git history - only secrets that are NOT in the current files
+    history_report = []
+    commits_scanned = 0
+    if in_git:
+        history, commits_scanned = scan_git_history(root)
+        current_secrets = {f["raw"] for f in findings}
+        for h in history:
+            if h["raw"] in current_secrets:
+                continue
+            h["severity"] = "CRITICAL"
+            h["reason"] = "Deleted from code but still in git history - rotate this key NOW"
+            history_report.append(h)
+
     findings.sort(key=lambda f: SEVERITY_ORDER.index(f["severity"]))
     env_report.sort(key=lambda e: SEVERITY_ORDER.index(e["severity"]))
+
+    # 3. Print
+    for h in history_report:
+        print(f"[{h['severity']}] {h['type']}  (git history)")
+        print(f"    File:   {h['file']}")
+        print(f"    Commit: {h['commit']}  ({h['date']})")
+        print(f"    Value:  {h['value']}")
+        print(f"    Reason: {h['reason']}\n")
 
     for f in findings:
         print(f"[{f['severity']}] {f['type']}")
@@ -181,11 +249,12 @@ def main():
         print(f"    Reason: {e['reason']}\n")
 
     counts = {level: 0 for level in SEVERITY_ORDER}
-    for item in findings + env_report:
+    for item in history_report + findings + env_report:
         counts[item["severity"]] += 1
 
     print("-" * 40)
-    print(f"Files scanned: {files_scanned}")
+    print(f"Files scanned:   {files_scanned}")
+    print(f"Commits scanned: {commits_scanned}")
     for level in SEVERITY_ORDER:
         print(f"  {level:<9} {counts[level]}")
 
