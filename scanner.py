@@ -1,12 +1,17 @@
 """
-LeakLens v0.3 - Secret scanner with git history scanning
-Usage: python scanner.py [folder]
+LeakLens v0.4 - Secret scanner for local folders and remote git repos
+Usage:
+    python scanner.py [folder]
+    python scanner.py https://github.com/user/repo
 """
 
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 
 PATTERNS = {
     "Anthropic API Key": re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"),
@@ -29,6 +34,9 @@ ENV_FILE_NAMES = {".env", ".env.local", ".env.production", ".env.development"}
 
 SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
 
+# Never let git stop and wait for a username/password
+GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+
 
 def mask(secret):
     """Hide most of the secret so we never print it in full."""
@@ -48,6 +56,7 @@ def run_git(root, args):
             text=True,
             encoding="utf-8",
             errors="ignore",
+            env=GIT_ENV,
         )
     except FileNotFoundError:
         return None
@@ -95,6 +104,55 @@ def classify(root, rel_path, in_git, cache):
 
     cache[rel_path] = status
     return status
+
+
+# ---------- remote repos ----------
+
+def is_url(target):
+    return target.startswith("https://") or target.startswith("http://")
+
+
+def force_remove(func, path, _error):
+    """Windows marks some git files read-only. Make them writable and retry."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def remove_folder(path):
+    """Delete a folder and everything inside it."""
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=force_remove)
+    else:
+        shutil.rmtree(path, onerror=force_remove)
+
+
+def clone_repo(url):
+    """Clone a repo with full history into a new temporary folder."""
+    temp_dir = tempfile.mkdtemp(prefix="leaklens_")
+    print(f"Cloning {url} ...")
+
+    try:
+        # "--" means: everything after this is a URL/path, never an option.
+        result = subprocess.run(
+            ["git", "clone", "--quiet", "--", url, temp_dir],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            env=GIT_ENV,
+        )
+    except FileNotFoundError:
+        remove_folder(temp_dir)
+        print("Error: git is not installed")
+        sys.exit(2)
+
+    if result.returncode != 0:
+        remove_folder(temp_dir)
+        print("Error: could not clone the repo (wrong URL, or it is private)")
+        print(result.stderr.strip())
+        sys.exit(2)
+
+    return temp_dir
 
 
 # ---------- scanning current files ----------
@@ -191,15 +249,10 @@ def scan_git_history(root):
 
 # ---------- report ----------
 
-def main():
-    root = sys.argv[1] if len(sys.argv) > 1 else "."
-
-    if not os.path.isdir(root):
-        print(f"Error: '{root}' is not a folder")
-        sys.exit(1)
-
+def run_scan(root, label):
+    """Scan one folder, print the report, and return the exit code."""
     in_git = is_git_repo(root)
-    print(f"Scanning: {os.path.abspath(root)}")
+    print(f"Scanning: {label}")
     print(f"Git repo: {'yes' if in_git else 'no'}\n")
 
     # 1. Current files
@@ -259,8 +312,28 @@ def main():
         print(f"  {level:<9} {counts[level]}")
 
     # Exit code 1 = problems found (useful later for automation / CI)
-    if counts["CRITICAL"] or counts["HIGH"]:
-        sys.exit(1)
+    return 1 if counts["CRITICAL"] or counts["HIGH"] else 0
+
+
+def main():
+    target = sys.argv[1] if len(sys.argv) > 1 else "."
+
+    # Remote repo: clone -> scan -> always delete the clone
+    if is_url(target):
+        temp_dir = clone_repo(target)
+        try:
+            exit_code = run_scan(temp_dir, label=target)
+        finally:
+            remove_folder(temp_dir)
+            print("Temporary clone deleted.")
+        sys.exit(exit_code)
+
+    # Local folder
+    if not os.path.isdir(target):
+        print(f"Error: '{target}' is not a folder or a URL")
+        sys.exit(2)
+
+    sys.exit(run_scan(target, label=os.path.abspath(target)))
 
 
 if __name__ == "__main__":
