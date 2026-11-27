@@ -1,10 +1,12 @@
 """
-LeakLens v0.4 - Secret scanner for local folders and remote git repos
+LeakLens v0.5 - Secret scanner for local folders and remote git repos
 Usage:
     python scanner.py [folder]
     python scanner.py https://github.com/user/repo
 """
 
+import base64
+import json
 import os
 import re
 import shutil
@@ -14,13 +16,32 @@ import sys
 import tempfile
 
 PATTERNS = {
+    # AI providers
     "Anthropic API Key": re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"),
     "OpenAI API Key": re.compile(r"sk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{20,}"),
+    # Cloud and dev platforms
     "AWS Access Key": re.compile(r"AKIA[0-9A-Z]{16}"),
     "GitHub Token": re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"),
     "Stripe Live Key": re.compile(r"sk_live_[A-Za-z0-9]{20,}"),
     "Google API Key": re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+    "Google Service Account": re.compile(r"\"type\"\s*:\s*\"service_account\""),
     "Private Key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    # Supabase
+    "Supabase Secret Key": re.compile(r"sb_secret_[A-Za-z0-9_-]{20,}"),
+    "JWT": re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+    # Bots
+    "Telegram Bot Token": re.compile(r"[0-9]{8,10}:AA[A-Za-z0-9_-]{33}"),
+    # Databases (only URLs that contain a password)
+    "Database URL": re.compile(
+        r"(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://"
+        r"[^\s:@/\"']+:(?P<password>[^\s@/\"']+)@[^\s/\"']+"
+    ),
+}
+
+# Passwords that are examples, not real secrets
+PLACEHOLDER_PASSWORDS = {
+    "password", "pass", "passwd", "secret", "changeme", "example",
+    "xxx", "xxxx", "your_password", "yourpassword", "123456", "postgres", "root",
 }
 
 SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", ".next", "dist", "build"}
@@ -43,6 +64,45 @@ def mask(secret):
     if len(secret) <= 12:
         return secret[:3] + "..."
     return secret[:6] + "..." + secret[-4:]
+
+
+# ---------- detection ----------
+
+def jwt_role(token):
+    """Read the 'role' field from inside a JWT, without verifying it."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)  # base64 needs padding
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data.get("role")
+    except (ValueError, IndexError):
+        return None
+
+
+def is_placeholder_password(password):
+    p = password.lower()
+    return p in PLACEHOLDER_PASSWORDS or p.startswith("$") or "<" in p or "{" in p
+
+
+def find_secrets(line):
+    """Return (name, secret) for every real secret in one line of text."""
+    results = []
+    for name, pattern in PATTERNS.items():
+        for match in pattern.finditer(line):
+            secret = match.group()
+
+            if name == "JWT":
+                # The anon key is public by design. Only service_role is dangerous.
+                if jwt_role(secret) != "service_role":
+                    continue
+                name = "Supabase Service Role Key"
+
+            elif name == "Database URL":
+                if is_placeholder_password(match.group("password")):
+                    continue
+
+            results.append((name, secret))
+    return results
 
 
 # ---------- git helpers ----------
@@ -163,9 +223,8 @@ def scan_file(path):
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             for line_number, line in enumerate(f, start=1):
-                for name, pattern in PATTERNS.items():
-                    for match in pattern.finditer(line):
-                        findings.append((name, line_number, match.group()))
+                for name, secret in find_secrets(line):
+                    findings.append((name, line_number, secret))
     except OSError:
         pass
     return findings
@@ -230,19 +289,17 @@ def scan_git_history(root):
             current_file = line[6:] if line.startswith("+++ b/") else line[4:]
 
         elif line.startswith("+"):
-            for name, pattern in PATTERNS.items():
-                for match in pattern.finditer(line):
-                    secret = match.group()
-                    # git log shows newest first, so the LAST time we see
-                    # a secret is the commit where it was first added.
-                    found[secret] = {
-                        "file": current_file,
-                        "type": name,
-                        "commit": commit,
-                        "date": date,
-                        "value": mask(secret),
-                        "raw": secret,
-                    }
+            for name, secret in find_secrets(line):
+                # git log shows newest first, so the LAST time we see
+                # a secret is the commit where it was first added.
+                found[secret] = {
+                    "file": current_file,
+                    "type": name,
+                    "commit": commit,
+                    "date": date,
+                    "value": mask(secret),
+                    "raw": secret,
+                }
 
     return list(found.values()), commits_scanned
 
